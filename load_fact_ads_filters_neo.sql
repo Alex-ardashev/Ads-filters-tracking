@@ -173,3 +173,351 @@ SELECT *
 FROM   t6
 
 ;
+
+
+-- REDUNDANCY SCORE --
+
+CREATE TABLE IF not EXISTS hive.odyn_css.fact_ads_filters_neo_dashboard_redundancy_score
+             (
+                          site_code                     VARCHAR,
+                          filter_id                     VARCHAR,
+                          filter_version                VARCHAR,
+                          filter_body                   VARCHAR,
+                          filter_default_decision       VARCHAR,
+                          filter_detection              INTEGER,
+                          filter_detection_only         INTEGER,
+                          avg_filter_false_positive     DOUBLE,
+                          filter_false_positive_only    INTEGER,
+                          YEAR                          VARCHAR,
+                          MONTH                         VARCHAR,
+                          DAY                           VARCHAR
+             )
+WITH
+             (
+                          format = 'PARQUET',
+                          partitioned_by = ARRAY ['YEAR', 'MONTH', 'DAY']
+             );
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+DELETE
+FROM   hive.odyn_css.fact_ads_filters_neo_dashboard_redundancy_score
+WHERE     YEAR = '${vars:year}'
+      AND MONTH = '${vars:month}'
+      AND DAY = '${vars:day}';
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+INSERT INTO hive.odyn_css.fact_ads_filters_neo_dashboard_redundancy_score
+
+WITH filternormal_first AS
+(
+         SELECT   params_content_event_adid                                                        AS adid,
+                  params_content_event_sitecode                                                    AS site_code,
+                  cast(Json_parse(params_content_event_extra_matchescompressed) AS ARRAY<varchar>) AS filter,
+                  year,
+                  month,
+                  day,
+                  max(
+                  CASE
+                           WHEN params_content_event_extra_verdictsrules IS NOT NULL
+                           AND      params_content_event_extra_verdictsrules != '[]'
+                           AND      params_content_event_extra_verdictsrules != '["ad-filters"]' THEN 1
+                           ELSE 0
+                  END) AS ad_scorer_detection
+                  -- ad scorer or some other rule detection to be precise, it happens only
+                  -- when verdict rules contains something else than
+                  -- empty collection / null / just ad-filters
+         FROM     hive.hydra.global_css_verdicts
+         WHERE    params_content_event_source = 'ad-filters'
+         AND      cast(concat(year,'-',month,'-',day) AS date) = date('${vars:date}')
+         GROUP BY 1,2,3,4,5,6
+    ), 
+
+filternormal AS
+(
+           SELECT     adid,
+                      site_code,
+                      ad_scorer_detection,
+                      element_at(cast(split(filter_split, '|') AS array<varchar>) ,1) AS filter_id,
+                      element_at(cast(split(filter_split, '|') as ARRAY<VARCHAR>) ,2) AS filter_version,
+                      element_at(cast(split(filter_split, '|') as ARRAY<VARCHAR>) ,3) AS filter_body,
+                      element_at(cast(split(filter_split, '|') as ARRAY<VARCHAR>) ,4) AS filter_default_decision,
+
+                      year,
+                      month,
+                      day
+           FROM       filternormal_first v
+           CROSS JOIN unnest(v.filter) AS t(filter_split) 
+    ), 
+
+filterotherverdicts_first AS
+(
+         SELECT   params_content_event_adid AS adid,
+                  params_content_event_sitecode AS site_code,
+                  cast(
+                      COALESCE( 
+                      json_extract(params_content_event_extra_otherverdicts, '$[0].extra.matchesComressed'), 
+                      json_extract(params_content_event_extra_otherverdicts, '$[1].extra.matchesCompressed'), 
+                      json_extract(params_content_event_extra_otherverdicts, '$[2].extra.matchesCompressed'), 
+                      json_extract(params_content_event_extra_otherverdicts, '$[3].extra.matchesCompressed') ) 
+                      AS array<varchar>) AS filter,
+                  year,
+                  month,
+                  day,
+                  max(
+                  CASE
+                      WHEN params_content_event_source = 'ad-scorer' THEN 1
+                      ELSE 0
+                  END) AS ad_scorer_detection
+         FROM     hive.hydra.global_css_verdicts
+         WHERE    params_content_event_source != 'ad-filters'
+         AND      cast(concat(year,'-',month,'-',day) AS date) = date('${vars:date}')
+         GROUP BY 1,2,3,4,5,6), 
+
+filterotherverdicts AS
+(
+           SELECT     adid,
+                      site_code,
+                      ad_scorer_detection,
+                      element_at(cast(split(filter_split, '|') AS array<varchar>) ,1) AS filter_id,
+                      element_at(cast(split(filter_split, '|') as ARRAY<VARCHAR>) ,2) AS filter_version,
+                      element_at(cast(split(filter_split, '|') as ARRAY<VARCHAR>) ,3) AS filter_body,
+                      element_at(cast(split(filter_split, '|') as ARRAY<VARCHAR>) ,4) AS filter_default_decision,
+
+                      year,
+                      month,
+                      day
+           FROM       filterotherverdicts_first v
+           CROSS JOIN unnest(v.filter) AS t(filter_split) ), 
+
+filter AS
+(
+       SELECT *
+       FROM   filternormal
+       UNION ALL
+       SELECT *
+       FROM   filterotherverdicts ), 
+       
+adscorerpremod AS
+(
+                SELECT DISTINCT params_content_event_adid     AS adid,
+                                params_content_event_sitecode AS site_code
+                FROM            hive.hydra.global_css_verdicts
+                WHERE           params_content_event_source = 'ad-scorer'
+                AND             params_content_meta_type IN ('ad.verdict.reject',
+                                                             'ad.verdict.premoderate')
+                AND             cast(concat(year,'-',month,'-',day) AS date) = date('${vars:date}') ), 
+
+moderatordecisions AS
+(
+                SELECT DISTINCT params_content_event_adid     AS adid,
+                                params_content_event_sitecode AS site_code
+                FROM            hive.hydra.global_css_decisions
+                WHERE           params_content_event_moderationcategory = 'default'
+                AND             params_content_event_type = 'reject'
+                AND             cast(concat(year,'-',month,'-',day) AS date) = date('${vars:date}') ), 
+
+data AS
+(
+          SELECT    f.filter_id,
+                    f.filter_version,
+                    f.filter_body,
+                    f.filter_default_decision,
+                    f.site_code,
+                    f.year,
+                    f.month,
+                    f.day,
+                    CASE
+                              WHEN m.adid IS NOT NULL
+                              AND       f.adid IS NOT NULL THEN 1
+                              ELSE 0
+                    END AS filter_detection,
+                    CASE
+                              WHEN m.adid IS NOT NULL
+                              AND       f.adid IS NOT NULL
+                              AND       a.adid IS NULL
+                              AND       f.ad_scorer_detection = 0 THEN 1
+                              ELSE 0
+                    END AS filter_detection_only,
+                    CASE
+                              WHEN m.adid IS NULL
+                              AND       f.adid IS NOT NULL THEN 1
+                              ELSE 0
+                    END AS filter_fp,
+                    CASE
+                              WHEN m.adid IS NULL
+                              AND       f.adid IS NOT NULL
+                              AND       a.adid IS NULL THEN 1
+                              ELSE 0
+                    END AS filter_fp_only
+          FROM      filter f
+          LEFT JOIN moderatordecisions m
+          ON        m.adid = f.adid
+          AND       m.site_code = f.site_code
+          LEFT JOIN adscorerpremod a
+          ON        m.adid = a.adid
+          AND       m.site_code = a.site_code )
+SELECT   site_code,
+         filter_id,
+         filter_version,
+         filter_body,
+         filter_default_decision,
+         sum(filter_detection)      filter_detection,
+         sum(filter_detection_only) filter_detection_only,
+         avg(filter_fp)             AVG_filter_false_positive,
+         sum(filter_fp_only)        filter_false_positive_only,
+         year,
+         month,
+         day
+         -- 100.0 * (sum(filter_detection) - sum(filter_detection_only)) / sum(filter_detection) as coverage,
+         -- 100.0 - 100.0*avg(filter_fp) as precision
+FROM     data
+GROUP BY 1,2,3,4,5,10,11,12
+
+;
+
+
+-- Dashboard --
+
+CREATE TABLE IF not EXISTS hive.odyn_css.fact_ads_filters_neo_dashboard
+             (
+                          site_code          VARCHAR,
+                          filter_id          VARCHAR,
+                          filter_version     VARCHAR,
+                          filter_body        VARCHAR,
+                          filter_default_decision       VARCHAR, --decision for each filter standalone
+                          moderator_decision VARCHAR,
+                          filter_decision    VARCHAR,            --decision for filters combination
+                          trigger_timestamp  TIMESTAMP,
+                          hours              VARCHAR,
+                          total_decisions    INTEGER,
+                          YEAR               VARCHAR,
+                          MONTH              VARCHAR,
+                          DAY                VARCHAR
+             )
+WITH
+             (
+                          format = 'PARQUET',
+                          partitioned_by = ARRAY ['YEAR', 'MONTH', 'DAY']
+             );
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+DELETE
+FROM   hive.odyn_css.fact_ads_filters_neo_dashboard
+WHERE YEAR = '${vars:year}'
+      AND MONTH = '${vars:month}'
+      AND DAY = '${vars:day}';
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+INSERT INTO hive.odyn_css.fact_ads_filters_neo_dashboard
+SELECT site_code,
+       filter_id,
+       filter_version,
+       filter_body,
+       filter_default_decision, --decision for each filter standalone
+       moderator_decision,
+       filter_decision, --decision for filters combination
+       trigger_timestamp,
+       hours,
+       count(ad_id) as total_decisions,
+       YEAR,
+       MONTH,
+       DAY
+FROM   hive.odyn_css.fact_ads_filters_neo
+WHERE  cast(concat(year,'-',month,'-',day) AS DATE) = date('${vars:date}')
+group by 1,2,3,4,5,6,7,8,9,11,12,13
+;
+            
+
+
+-- Sampling --
+
+CREATE TABLE IF not EXISTS hive.odyn_css.fact_ads_filters_neo_dashboard_sampled
+             (
+                          site_code          VARCHAR,
+                          filter_id          VARCHAR,
+                          filter_version     VARCHAR,
+                          filter_body        VARCHAR,
+                          filter_default_decision       VARCHAR, --decision for each filter standalone
+                          moderator_decision VARCHAR,
+                          filter_decision    VARCHAR,            --decision for filters combination
+                          trigger_timestamp  TIMESTAMP,
+                          ad_id              VARCHAR,
+                          hours              VARCHAR,
+                          YEAR               VARCHAR,
+                          MONTH              VARCHAR,
+                          DAY                VARCHAR
+             )
+WITH
+             (
+                          format = 'PARQUET',
+                          partitioned_by = ARRAY ['YEAR', 'MONTH', 'DAY']
+             );
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+DELETE
+FROM   hive.odyn_css.fact_ads_filters_neo_dashboard_sampled
+WHERE YEAR <= '${vars:year}'
+      AND MONTH <= '${vars:month}'
+      AND DAY <= '${vars:day}';
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+INSERT INTO hive.odyn_css.fact_ads_filters_neo_dashboard_sampled
+
+
+WITH tab1 AS (
+                     SELECT site_code,
+                            filter_id,
+                            filter_version,
+                            filter_body,
+                            filter_default_decision, --decision for each filter standalone
+                            moderator_decision,
+                            filter_decision, --decision for filters combination
+                            trigger_timestamp,
+                            ad_id,
+                            ROW_NUMBER() OVER (PARTITION BY site_code,filter_id, filter_version order by trigger_timestamp desc) AS rn,
+                            hours,
+                            YEAR,
+                            MONTH,
+                            DAY
+                     FROM   hive.odyn_css.fact_ads_filters_neo
+                     WHERE  filter_decision != 'reject' AND moderator_decision = 'accept'
+                     AND    cast(concat(year,'-',month,'-',day) AS DATE) BETWEEN Date('${vars:date}') - interval '2' day AND Date('${vars:date}')
+            )
+
+SELECT                      site_code,
+                            filter_id,
+                            filter_version,
+                            filter_body,
+                            filter_default_decision, --decision for each filter standalone
+                            moderator_decision,
+                            filter_decision, --decision for filters combination
+                            trigger_timestamp,
+                            ad_id,
+                            hours,
+                            YEAR,
+                            MONTH,
+                            DAY
+FROM tab1
+WHERE rn < 6
+order by site_code, filter_id, filter_version
+;
+
+
